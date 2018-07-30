@@ -35,7 +35,6 @@ import tensorflow as tf
 
 from official.transformer import compute_bleu
 from official.transformer import translate
-from official.transformer.data_download import VOCAB_FILE
 from official.transformer.model import model_params
 from official.transformer.model import transformer
 from official.transformer.utils import dataset
@@ -43,20 +42,23 @@ from official.transformer.utils import metrics
 from official.transformer.utils import schedule
 from official.transformer.utils import tokenizer
 from official.utils.accelerator import tpu as tpu_util
+from official.utils.export import export
 from official.utils.flags import core as flags_core
 from official.utils.logs import hooks_helper
 from official.utils.logs import logger
+from official.utils.misc import distribution_utils
 from official.utils.misc import model_helpers
-
 
 PARAMS_MAP = {
     "tiny": model_params.TINY_PARAMS,
     "base": model_params.BASE_PARAMS,
     "big": model_params.BIG_PARAMS,
 }
+
+
 DEFAULT_TRAIN_EPOCHS = 10
-BLEU_DIR = "bleu"
 INF = int(1e9)
+BLEU_DIR = "bleu"
 
 # Dictionary containing tensors that are logged by the logging hooks. Each item
 # maps a string to the tensor name.
@@ -82,7 +84,10 @@ def model_fn(features, labels, mode, params):
         raise NotImplementedError("Prediction is not yet supported on TPUs.")
       return tf.estimator.EstimatorSpec(
           tf.estimator.ModeKeys.PREDICT,
-          predictions=logits)
+          predictions=logits,
+          export_outputs={
+              "translate": tf.estimator.export.PredictOutput(logits)
+          })
 
     # Explicitly set the shape of the logits for XLA (TPU). This is needed
     # because the logits are passed back to the host VM CPU for metric
@@ -182,18 +187,20 @@ def get_train_op_and_metrics(loss, params):
     tvars = tf.trainable_variables()
     gradients = optimizer.compute_gradients(
         loss, tvars, colocate_gradients_with_ops=True)
-    train_op = optimizer.apply_gradients(
+    minimize_op = optimizer.apply_gradients(
         gradients, global_step=global_step, name="train")
+    update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS)
+    train_op = tf.group(minimize_op, update_ops)
 
-    metrics = {"learning_rate": learning_rate}
+    train_metrics = {"learning_rate": learning_rate}
 
     if not params["use_tpu"]:
       # gradient norm is not included as a summary when running on TPU, as
       # it can cause instability between the TPU and the host controller.
       gradient_norm = tf.global_norm(list(zip(*gradients))[0])
-      metrics["global_norm/gradient_norm"] = gradient_norm
+      train_metrics["global_norm/gradient_norm"] = gradient_norm
 
-    return train_op, metrics
+    return train_op, train_metrics
 
 
 def translate_and_compute_bleu(estimator, subtokenizer, bleu_source, bleu_ref):
@@ -218,9 +225,9 @@ def get_global_step(estimator):
   return int(estimator.latest_checkpoint().split("-")[-1])
 
 
-def evaluate_and_log_bleu(estimator, bleu_source, bleu_ref, vocab_file_path):
+def evaluate_and_log_bleu(estimator, bleu_source, bleu_ref, vocab_file):
   """Calculate and record the BLEU score."""
-  subtokenizer = tokenizer.Subtokenizer(vocab_file_path)
+  subtokenizer = tokenizer.Subtokenizer(vocab_file)
 
   uncased_score, cased_score = translate_and_compute_bleu(
       estimator, subtokenizer, bleu_source, bleu_ref)
@@ -230,9 +237,15 @@ def evaluate_and_log_bleu(estimator, bleu_source, bleu_ref, vocab_file_path):
   return uncased_score, cased_score
 
 
+def _validate_file(filepath):
+  """Make sure that file exists."""
+  if not tf.gfile.Exists(filepath):
+    raise tf.errors.NotFoundError(None, None, "File %s not found." % filepath)
+
+
 def run_loop(
     estimator, schedule_manager, train_hooks=None, benchmark_logger=None,
-    bleu_source=None, bleu_ref=None, bleu_threshold=None, vocab_file_path=None):
+    bleu_source=None, bleu_ref=None, bleu_threshold=None, vocab_file=None):
   """Train and evaluate model, and optionally compute model's BLEU score.
 
   **Step vs. Epoch vs. Iteration**
@@ -264,8 +277,19 @@ def run_loop(
     bleu_source: File containing text to be translated for BLEU calculation.
     bleu_ref: File containing reference translations for BLEU calculation.
     bleu_threshold: minimum BLEU score before training is stopped.
-    vocab_file_path: Path to vocabulary file used to subtokenize bleu_source.
+    vocab_file: Path to vocab file that will be used to subtokenize bleu_source.
+
+  Raises:
+    ValueError: if both or none of single_iteration_train_steps and
+      single_iteration_train_epochs were defined.
+    NotFoundError: if the vocab file or bleu files don't exist.
   """
+  if bleu_source:
+    _validate_file(bleu_source)
+  if bleu_ref:
+    _validate_file(bleu_ref)
+  if vocab_file:
+    _validate_file(vocab_file)
 
   evaluate_bleu = bleu_source is not None and bleu_ref is not None
   if evaluate_bleu and schedule_manager.use_tpu:
@@ -323,7 +347,7 @@ def run_loop(
     # are compared to reference file to get the actual bleu score.
     if evaluate_bleu:
       uncased_score, cased_score = evaluate_and_log_bleu(
-          estimator, bleu_source, bleu_ref, vocab_file_path)
+          estimator, bleu_source, bleu_ref, vocab_file)
 
       # Write actual bleu scores using summary writer and benchmark logger
       global_step = get_global_step(estimator)
@@ -347,14 +371,15 @@ def run_loop(
 def define_transformer_flags():
   """Add flags and flag validators for running transformer_main."""
   # Add common flags (data_dir, model_dir, train_epochs, etc.).
-  flags_core.define_base(multi_gpu=False, num_gpu=False, export_dir=False)
+  flags_core.define_base()
   flags_core.define_performance(
       num_parallel_calls=True,
       inter_op=False,
       intra_op=False,
-      synthetic_data=False,
+      synthetic_data=True,
       max_train_steps=False,
-      dtype=False
+      dtype=False,
+      all_reduce_alg=True
   )
   flags_core.define_benchmark()
   flags_core.define_device(tpu=True)
@@ -367,7 +392,7 @@ def define_transformer_flags():
   # Add transformer-specific flags
   flags.DEFINE_enum(
       name="param_set", short_name="mp", default="big",
-      enum_values=["base", "big", "tiny"],
+      enum_values=PARAMS_MAP.keys(),
       help=flags_core.help_wrap(
           "Parameter set to use when creating and training the model. The "
           "parameters define the input shape (batch size and max length), "
@@ -401,22 +426,22 @@ def define_transformer_flags():
       name="bleu_source", short_name="bls", default=None,
       help=flags_core.help_wrap(
           "Path to source file containing text translate when calculating the "
-          "official BLEU score. --bleu_source, --bleu_ref, and --vocab_file "
-          "must be set. Use the flag --stop_threshold to stop the script based "
-          "on the uncased BLEU score."))
+          "official BLEU score. Both --bleu_source and --bleu_ref must be set. "
+          "Use the flag --stop_threshold to stop the script based on the "
+          "uncased BLEU score."))
   flags.DEFINE_string(
       name="bleu_ref", short_name="blr", default=None,
       help=flags_core.help_wrap(
           "Path to source file containing text translate when calculating the "
-          "official BLEU score. --bleu_source, --bleu_ref, and --vocab_file "
-          "must be set. Use the flag --stop_threshold to stop the script based "
-          "on the uncased BLEU score."))
+          "official BLEU score. Both --bleu_source and --bleu_ref must be set. "
+          "Use the flag --stop_threshold to stop the script based on the "
+          "uncased BLEU score."))
   flags.DEFINE_string(
-      name="vocab_file", short_name="vf", default=VOCAB_FILE,
+      name="vocab_file", short_name="vf", default=None,
       help=flags_core.help_wrap(
-          "Name of vocabulary file containing subtokens for subtokenizing the "
-          "bleu_source file. This file is expected to be in the directory "
-          "defined by --data_dir."))
+          "Path to subtoken vocabulary file. If data_download.py was used to "
+          "download and encode the training data, look in the data_dir to find "
+          "the vocab file."))
 
   flags_core.set_defaults(data_dir="/tmp/translate_ende",
                           model_dir="/tmp/transformer_model",
@@ -431,22 +456,30 @@ def define_transformer_flags():
     return flag_dict["train_epochs"] is None or flag_dict["train_steps"] is None
 
   @flags.multi_flags_validator(
-      ["data_dir", "bleu_source", "bleu_ref", "vocab_file"],
-      message="--bleu_source, --bleu_ref, and/or --vocab_file don't exist. "
-              "Please ensure that the file paths are correct.")
+      ["bleu_source", "bleu_ref"],
+      message="Both or neither --bleu_source and --bleu_ref must be defined.")
   def _check_bleu_files(flags_dict):
-    """Validate files when bleu_source and bleu_ref are defined."""
-    if flags_dict["bleu_source"] is None or flags_dict["bleu_ref"] is None:
-      return True
-    # Ensure that bleu_source, bleu_ref, and vocab files exist.
-    vocab_file_path = os.path.join(
-        flags_dict["data_dir"], flags_dict["vocab_file"])
-    return all([
-        tf.gfile.Exists(flags_dict["bleu_source"]),
-        tf.gfile.Exists(flags_dict["bleu_ref"]),
-        tf.gfile.Exists(vocab_file_path)])
+    return (flags_dict["bleu_source"] is None) == (
+        flags_dict["bleu_ref"] is None)
 
-  flags_core.require_cloud_storage(["data_dir", "model_dir"])
+  @flags.multi_flags_validator(
+      ["bleu_source", "bleu_ref", "vocab_file"],
+      message="--vocab_file must be defined if --bleu_source and --bleu_ref "
+              "are defined.")
+  def _check_bleu_vocab_file(flags_dict):
+    if flags_dict["bleu_source"] and flags_dict["bleu_ref"]:
+      return flags_dict["vocab_file"] is not None
+    return True
+
+  @flags.multi_flags_validator(
+      ["export_dir", "vocab_file"],
+      message="--vocab_file must be defined if --export_dir is set.")
+  def _check_export_vocab_file(flags_dict):
+    if flags_dict["export_dir"]:
+      return flags_dict["vocab_file"] is not None
+    return True
+
+  flags_core.require_cloud_storage(["data_dir", "model_dir", "export_dir"])
 
 
 def construct_estimator(flags_obj, params, schedule_manager):
@@ -461,8 +494,11 @@ def construct_estimator(flags_obj, params, schedule_manager):
     An estimator object to be used for training and eval.
   """
   if not params["use_tpu"]:
+    distribution_strategy = distribution_utils.get_distribution_strategy(
+        flags_core.get_num_gpus(flags_obj), flags_obj.all_reduce_alg)
     return tf.estimator.Estimator(
-        model_fn=model_fn, model_dir=flags_obj.model_dir, params=params)
+        model_fn=model_fn, model_dir=flags_obj.model_dir, params=params,
+        config=tf.estimator.RunConfig(train_distribute=distribution_strategy))
 
   tpu_cluster_resolver = tf.contrib.cluster_resolver.TPUClusterResolver(
       tpu=flags_obj.tpu,
@@ -498,19 +534,36 @@ def run_transformer(flags_obj):
   Args:
     flags_obj: Object containing parsed flag values.
   """
+  num_gpus = flags_core.get_num_gpus(flags_obj)
+
   # Add flag-defined parameters to params object
   params = PARAMS_MAP[flags_obj.param_set]
+  if num_gpus > 1:
+    if flags_obj.param_set == "big":
+      params = model_params.BIG_MULTI_GPU_PARAMS
+    elif flags_obj.param_set == "base":
+      params = model_params.BASE_MULTI_GPU_PARAMS
+
   params["data_dir"] = flags_obj.data_dir
   params["model_dir"] = flags_obj.model_dir
   params["num_parallel_calls"] = flags_obj.num_parallel_calls
 
   params["tpu"] = flags_obj.tpu
   params["use_tpu"] = bool(flags_obj.tpu)  # was a tpu specified.
-  params["batch_size"] = flags_obj.batch_size or (
-      params["default_batch_size_tpu"] if params["use_tpu"]
-      else params["default_batch_size"])
   params["static_batch"] = flags_obj.static_batch or params["use_tpu"]
   params["allow_ffn_pad"] = not params["use_tpu"]
+
+  params["use_synthetic_data"] = flags_obj.use_synthetic_data
+
+  # Set batch size parameter, which depends on the availability of
+  # TPU and GPU, and distribution settings.
+  params["batch_size"] = (flags_obj.batch_size or (
+      params["default_batch_size_tpu"] if params["use_tpu"]
+      else params["default_batch_size"]))
+
+  if not params["use_tpu"]:
+    params["batch_size"] = distribution_utils.per_device_batch_size(
+        params["batch_size"], num_gpus)
 
   schedule_manager = schedule.Manager(
       train_steps=flags_obj.train_steps,
@@ -526,9 +579,12 @@ def run_transformer(flags_obj):
 
   params["repeat_dataset"] = schedule_manager.repeat_dataset
 
+  model_helpers.apply_clean(flags.FLAGS)
+
   # Create hooks that log information about the training and metric values
   train_hooks = hooks_helper.get_train_hooks(
       flags_obj.hooks,
+      model_dir=flags_obj.model_dir,
       tensors_to_log=TENSORS_TO_LOG,  # used for logging hooks
       batch_size=schedule_manager.batch_size,  # for ExamplesPerSecondHook
       use_tpu=params["use_tpu"]  # Not all hooks can run with TPUs
@@ -552,7 +608,20 @@ def run_transformer(flags_obj):
       bleu_source=flags_obj.bleu_source,
       bleu_ref=flags_obj.bleu_ref,
       bleu_threshold=flags_obj.stop_threshold,
-      vocab_file_path=os.path.join(flags_obj.data_dir, flags_obj.vocab_file))
+      vocab_file=flags_obj.vocab_file)
+
+  if flags_obj.export_dir:
+    serving_input_fn = export.build_tensor_serving_input_receiver_fn(
+        shape=[None], dtype=tf.int64, batch_size=None)
+    # Export saved model, and save the vocab file as an extra asset. The vocab
+    # file is saved to allow consistent input encoding and output decoding.
+    # (See the "Export trained model" section in the README for an example of
+    # how to use the vocab file.)
+    # Since the model itself does not use the vocab file, this file is saved as
+    # an extra asset rather than a core asset.
+    estimator.export_savedmodel(
+        flags_obj.export_dir, serving_input_fn,
+        assets_extra={"vocab.txt": flags_obj.vocab_file})
 
 
 def main(_):
